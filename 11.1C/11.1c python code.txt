@@ -1,0 +1,272 @@
+
+import os, io, time, smtplib, socket, subprocess, threading, warnings
+from datetime import datetime
+from email.message import EmailMessage
+
+
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+EMAIL_FROM = "sumitgrover854@gmail.com"
+EMAIL_TO   = "sumitgrover854@gmail.com"
+EMAIL_USER = "sumitgrover854@gmail.com"
+EMAIL_PASS = "yilrnxdlmyvorija"  
+
+DISTANCE_CM_THRESHOLD = 80         
+COOLDOWN_SECONDS      = 20        
+IMAGE_DIR             = os.path.expanduser("~/doorbell/captures")
+STREAM_PORT           = 8000
+
+BUTTON_GPIO = 22
+TRIG_GPIO   = 27
+ECHO_GPIO   = 17
+
+MQTT_HOST = "127.0.0.1"
+MQTT_PORT = 1883
+MQTT_USER = "door"
+MQTT_PASS = "ags"
+MQTT_TOPIC_CMD    = "door/lock/cmd"
+MQTT_TOPIC_STATUS = "door/lock/status"
+
+SERVO_API_TOKEN = "MyStrongDoorToken123"
+
+
+def get_pi_ip():
+    try:
+        out = subprocess.check_output(["hostname", "-I"], text=True).strip()
+        return out.split()[0]
+    except Exception:
+        return "127.0.0.1"
+
+PI_IP = get_pi_ip()
+LIVE_URL = f"http://{PI_IP}:{STREAM_PORT}/"
+
+# ---------------- Camera (Picamera2) ----------------
+from picamera2 import Picamera2
+from libcamera import Transform
+from PIL import Image
+
+picam2 = Picamera2()
+config = picam2.create_still_configuration(
+    main={"size": (1280, 720)},
+    transform=Transform(hflip=0, vflip=0)  # set to 1 if camera is flipped
+)
+picam2.configure(config)
+picam2.start()
+
+def capture_jpeg_bytes():
+    frame = picam2.capture_array("main")
+    img = Image.fromarray(frame)
+    bio = io.BytesIO()
+    img.save(bio, format="JPEG", quality=90)
+    return bio.getvalue()
+
+# ---------------- Flask MJPEG Livestream ----------------
+from flask import Flask, Response, render_template_string, request
+app = Flask(__name__)
+
+HTML_PAGE = f"""<!doctype html>
+<title>Doorbell Live</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0f1115;color:#e6e6e6;margin:0}}
+.wrap{{padding:24px;text-align:center}}
+.card{{display:inline-block;background:#151821;padding:18px 20px;border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.35);max-width:980px}}
+h2{{margin:0 0 10px}}
+img{{max-width:95vw;border-radius:12px}}
+p{{opacity:.85}}
+code{{background:#1c2030;padding:2px 6px;border-radius:6px}}
+.row{{margin-top:14px}}
+input{{padding:8px 10px;border-radius:10px;border:0;background:#21263a;color:#e6e6e6;min-width:240px}}
+.btn{{display:inline-block;margin:10px 6px;padding:10px 16px;border-radius:10px;border:0;background:#2bb673;color:white;cursor:pointer}}
+.btn.red{{background:#e34b4b}}
+.small{{opacity:.8;font-size:.95rem}}
+#msg{{margin-top:10px;min-height:1.2em}}
+</style>
+<div class="wrap">
+  <div class="card">
+    <h2>Doorbell Live Stream</h2>
+    <p class="small">Stream URL: <code>{LIVE_URL}stream.mjpg</code></p>
+    <img src="{LIVE_URL}stream.mjpg" />
+    <div class="row">
+      <input id="token" placeholder="Token (saved)" />
+      <button class="btn" onclick="doServo('UNLOCK')">Unlock</button>
+      <button class="btn red" onclick="doServo('LOCK')">Lock</button>
+    </div>
+    <div id="msg"></div>
+  </div>
+</div>
+<script>
+const DEFAULT_TOKEN = "{SERVO_API_TOKEN}";
+const input = document.getElementById('token');
+input.value = localStorage.getItem('doorbell_token') || DEFAULT_TOKEN;
+input.addEventListener('change', ()=>localStorage.setItem('doorbell_token', input.value));
+
+async function doServo(action){{
+  const token = document.getElementById('token').value;
+  const r = await fetch('/api/servo?token='+encodeURIComponent(token), {{
+    method:'POST',
+    headers:{{'Content-Type':'application/json','X-Token':token}},
+    body: JSON.stringify({{action, token}})
+  }});
+  document.getElementById('msg').innerText = await r.text();
+}}
+</script>
+"""
+
+def stream_generator():
+    while True:
+        try:
+            jpg = capture_jpeg_bytes()
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
+            time.sleep(0.15)  # ~6-7 fps
+        except Exception:
+            time.sleep(0.5)
+
+@app.get("/")
+def index():
+    return render_template_string(HTML_PAGE)
+
+@app.get("/stream.mjpg")
+def stream():
+    return Response(stream_generator(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.get("/snap.jpg")
+def snap():
+    return Response(capture_jpeg_bytes(), mimetype="image/jpeg")
+
+# ---------------- Email helper ----------------
+def send_email_with_image(subject, body_text, jpeg_bytes, filename="snapshot.jpg"):
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg.set_content(body_text)
+    msg.add_attachment(jpeg_bytes, maintype="image", subtype="jpeg", filename=filename)
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        s.starttls()
+        s.login(EMAIL_USER, EMAIL_PASS)
+        s.send_message(msg)
+
+# ---------------- MQTT client ----------------
+import paho.mqtt.client as mqtt
+mqttc = mqtt.Client(client_id="doorbell-web")
+mqttc.username_pw_set(MQTT_USER, MQTT_PASS)
+_last_status = "UNKNOWN"
+
+def _on_mqtt_message(client, userdata, msg):
+    global _last_status
+    if msg.topic == MQTT_TOPIC_STATUS:
+        _last_status = msg.payload.decode(errors="ignore")
+
+mqttc.on_message = _on_mqtt_message
+mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+mqttc.subscribe(MQTT_TOPIC_STATUS)
+mqttc.loop_start()
+
+def _extract_token(req):
+    # Accept token via JSON body, header, or query string
+    try:
+        data = req.get_json(force=False, silent=True) or {}
+    except Exception:
+        data = {}
+    return (
+        (data.get("token") if isinstance(data, dict) else None)
+        or req.headers.get("X-Token")
+        or req.args.get("token")
+        or ""
+    )
+
+@app.post("/api/servo")
+def api_servo():
+    token = _extract_token(request)
+    action = (request.get_json(silent=True) or {}).get("action", "")
+    action = (action or request.args.get("action", "")).upper()
+    if token != SERVO_API_TOKEN:
+        return "AUTH FAIL", 401
+    if action not in ("LOCK","UNLOCK","STATUS"):
+        return "BAD ACTION", 400
+    mqttc.publish(MQTT_TOPIC_CMD, action, qos=0, retain=False)
+    return f"SENT {action}"
+
+@app.get("/api/servo/status")
+def api_servo_status():
+    return _last_status
+
+# ---------------- Sensors (gpiozero with pigpio timing) ----------------
+from gpiozero import DistanceSensor, Button, Device
+from gpiozero.pins.pigpio import PiGPIOFactory
+from gpiozero.exc import DistanceSensorNoEcho
+
+Device.pin_factory = PiGPIOFactory()  # pigpio daemon should be running
+warnings.filterwarnings("ignore", category=UserWarning, message="no echo received")
+
+distance = DistanceSensor(
+    echo=ECHO_GPIO,
+    trigger=TRIG_GPIO,
+    max_distance=3.5,   # meters
+    queue_len=5         # simple moving average
+)
+button = Button(BUTTON_GPIO, pull_up=True, bounce_time=0.15)
+
+last_alert_ts = 0
+def should_alert():
+    global last_alert_ts
+    now = time.time()
+    if now - last_alert_ts >= COOLDOWN_SECONDS:
+        last_alert_ts = now
+        return True
+    return False
+
+def handle_event(reason):
+    if not should_alert():
+        return
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    try:
+        jpg = capture_jpeg_bytes()
+    except Exception as e:
+        print(f"[ERR] Capture failed: {e}")
+        return
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    fn = os.path.join(IMAGE_DIR, f"{reason}_{ts}.jpg")
+    with open(fn, "wb") as f:
+        f.write(jpg)
+    subject = f"[Doorbell] {reason} at {ts}"
+    body = f"Event: {reason}\nTime: {ts}\nLive view: {LIVE_URL}\n"
+    try:
+        send_email_with_image(subject, body, jpg, filename=os.path.basename(fn))
+        print(f"[INFO] {reason} -> Email sent, saved {fn}")
+    except Exception as e:
+        print(f"[ERR] Email send failed: {e}")
+
+def on_button_pressed():
+    print("[EVENT] Doorbell button pressed")
+    handle_event("Doorbell_Press")
+
+button.when_pressed = on_button_pressed
+
+def monitor_distance_loop():
+    threshold_m = DISTANCE_CM_THRESHOLD / 100.0
+    time.sleep(0.5)  # let HC-SR04 settle
+    while True:
+        try:
+            d = distance.distance  # meters (averaged)
+            if 0.02 <= d < threshold_m:
+                print(f"[EVENT] Person near ({d*100:.1f} cm)")
+                handle_event("Person_Near")
+                time.sleep(1.0)  # hold-off to avoid bursts
+        except Exception:
+            pass
+        time.sleep(0.12)
+
+# ---------------- Main ----------------
+def run_flask():
+    app.run(host="0.0.0.0", port=STREAM_PORT, threaded=True)
+
+def main():
+    print("[BOOT] Doorbell starting…")
+    print(f"[BOOT] Stream URL: {LIVE_URL}")
+    threading.Thread(target=run_flask, daemon=True).start()
+    monitor_distance_loop()
+
+if __name__ == "__main__":
+    main()
