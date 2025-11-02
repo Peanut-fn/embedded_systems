@@ -1,0 +1,55 @@
+#include <Arduino_LSM6DS3.h>
+
+// Pin assignments
+const int buttonPin = 2;   // Push button
+const int led1 = 8;        // LED controlled by button
+const int led2 = 9;        // LED controlled by accelerometer
+
+// State variables
+volatile bool led1State = LOW;
+bool led2State = LOW;
+
+// ISR for button interrupt
+void buttonISR() {
+  led1State = !led1State;
+  digitalWrite(led1, led1State);
+  Serial.println("Button pressed -> LED1 toggled");
+}
+
+void setup() {
+  // Serial monitor
+  Serial.begin(9600);
+  while (!Serial);
+
+  // Pin modes
+  pinMode(led1, OUTPUT);
+  pinMode(led2, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP);
+
+  // Attach button interrupt
+  attachInterrupt(digitalPinToInterrupt(buttonPin), buttonISR, FALLING);
+
+  // Initialize IMU
+  if (!IMU.begin()) {
+    Serial.println("Failed to initialize IMU!");
+    while (1);
+  }
+  Serial.println("System ready. Press button or shake the board.");
+}
+
+void loop() {
+  float x, y, z;
+
+  // Read accelerometer values
+  if (IMU.accelerationAvailable()) {
+    IMU.readAcceleration(x, y, z);
+
+    // Detect strong movement (threshold ~1.5g)
+    if (abs(x) > 1.5 || abs(y) > 1.5 || abs(z) > 1.5) {
+      led2State = !led2State;
+      digitalWrite(led2, led2State);
+      Serial.println("Motion detected -> LED2 toggled");
+      delay(500); // debounce to avoid rapid toggling
+    }
+  }
+}

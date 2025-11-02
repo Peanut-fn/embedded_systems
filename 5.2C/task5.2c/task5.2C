@@ -1,0 +1,55 @@
+import RPi.GPIO as GPIO
+import tkinter as tk
+
+# ---------------------------
+# GPIO Setup
+# ---------------------------
+GPIO.setmode(GPIO.BCM)
+
+# Use three GPIO pins for LEDs
+LED_PINS = [18, 23, 24]
+
+for pin in LED_PINS:
+    GPIO.setup(pin, GPIO.OUT)
+
+# Create PWM objects for each LED
+pwms = [GPIO.PWM(pin, 100) for pin in LED_PINS]  # 100 Hz frequency
+for pwm in pwms:
+    pwm.start(0)  # start with 0% duty cycle (off)
+
+# ---------------------------
+# Function to change brightness
+# ---------------------------
+def change_brightness(index, value):
+    duty_cycle = int(value)
+    pwms[index].ChangeDutyCycle(duty_cycle)
+
+# ---------------------------
+# GUI Setup
+# ---------------------------
+root = tk.Tk()
+root.title("3-LED Intensity Control")
+
+sliders = []
+for i, pin in enumerate(LED_PINS):
+    slider = tk.Scale(root, from_=0, to=100, orient="horizontal",
+                      label=f"LED {i+1} Brightness",
+                      command=lambda val, idx=i: change_brightness(idx, val))
+    slider.pack()
+    sliders.append(slider)
+
+# ---------------------------
+# Cleanup when closing window
+# ---------------------------
+def on_close():
+    for pwm in pwms:
+        pwm.stop()
+    GPIO.cleanup()
+    root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+
+# ---------------------------
+# Run the GUI loop
+# ---------------------------
+root.mainloop()
